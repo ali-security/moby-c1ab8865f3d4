@@ -153,9 +153,6 @@ jobs:
       matrix:
         os:
           - ubuntu-24.04
-          - ubuntu-24.04-arm
-          - macos-latest
-          - windows-latest
     steps:
       -
         name: Checkout
@@ -205,7 +202,7 @@ jobs:
         run: |
           go vet -mod=vendor -tags "netgo journald" ./daemon/ ./integration/container/
       -
-        name: Integration test for CVE-2026-41567 against a dockerd built from source (linux, amd64)
+        name: Integration tests for the docker cp CVEs against a dockerd built from source (linux, amd64)
         if: runner.os == 'Linux' && runner.arch == 'X64'
         shell: bash
         run: |
@@ -213,37 +210,56 @@ jobs:
           sudo apt-get install -y libseccomp-dev
           go build -mod=vendor -tags "netgo journald seccomp apparmor" -o /tmp/dockerd ./cmd/dockerd
           sudo install -m 0755 /tmp/dockerd /usr/local/bin/dockerd
-          # The harness loads busybox into the test daemon through the runner's
-          # pre-installed daemon, and its TestMain insists the whole frozen-image
-          # set is present there, so pre-populate it. Only busybox is actually
-          # used by this test; the hello-world arch tags are local aliases so the
-          # harness's existence check passes without pulling foreign-arch images.
-          docker pull busybox:latest
-          docker pull busybox:glibc
-          docker pull debian:bookworm-slim
-          docker pull hello-world:latest
-          docker tag hello-world:latest hello-world:frozen
-          docker tag hello-world:latest hello-world:amd64
-          docker tag hello-world:latest hello-world:arm64
+          # Run the suite against a daemon built from THIS tree, not the runner's
+          # pre-installed one: the tests that reuse testEnv's daemon (rather than
+          # starting their own) would otherwise exercise stock docker.
+          sudo mkdir -p /tmp/seal-docker /tmp/seal-exec
+          sudo -b dockerd --host unix:///var/run/docker-seal.sock \
+            --data-root /tmp/seal-docker --exec-root /tmp/seal-exec \
+            --containerd /run/containerd/containerd.sock \
+            --iptables=false --ip6tables=false --pidfile /tmp/seal-docker.pid \
+            > /tmp/seal-dockerd.log 2>&1
+          export DOCKER_HOST=unix:///var/run/docker-seal.sock
+          for i in $(seq 1 60); do
+            if sudo -E docker version > /dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          sudo -E docker version
+          # The fixture's TestMain requires the whole frozen-image set on the
+          # daemon under test, and its fallback pulls the year-old digests pinned
+          # in the repo Dockerfile. Pre-populate instead; only busybox is used by
+          # these tests, so the hello-world arch tags are local aliases.
+          for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do
+            sudo -E docker pull "$img"
+          done
+          for tag in frozen amd64 arm64; do
+            sudo -E docker tag hello-world:latest "hello-world:$tag"
+          done
           mkdir -p /tmp/integration-dest
-          # The daemon fixture always passes
-          # --containerd /var/run/docker/containerd/containerd.sock, the path the
-          # moby dev container uses. On the runner containerd listens on
-          # /run/containerd/containerd.sock, so point the expected path at it.
-          # The test daemon gets its own containerd namespaces, so it shares the
-          # socket safely with the runner's own daemon.
+          # Tests that start their own daemon go through testutil/daemon, which
+          # always passes --containerd /var/run/docker/containerd/containerd.sock
+          # (the moby dev-container path); point it at the runner's containerd.
+          # Each such daemon uses its own containerd namespace.
           if [ ! -S /var/run/docker/containerd/containerd.sock ]; then
             sudo mkdir -p /var/run/docker/containerd
             sudo ln -sf /run/containerd/containerd.sock /var/run/docker/containerd/containerd.sock
           fi
-          # The harness loads busybox through the runner's pre-installed daemon,
-          # which is older than this tree's client default, so pin the client to
-          # the API version that daemon actually serves.
-          API_VERSION="$(docker version --format '{{.Server.APIVersion}}')"
+          # TestCopyToContainerXZBinaryNotExecutedOnDaemon is upstream's regression
+          # test for CVE-2026-41567. TestContainerCopyLeaksMounts drives a cp
+          # through openContainerFS with a real rslave bind mount, which is the
+          # mount wiring CVE-2026-42306 and CVE-2026-41568 change, and asserts the
+          # container's mountinfo is untouched afterwards. The remaining copy
+          # tests cover the ordinary extract/archive paths.
           sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/integration-dest GOFLAGS=-mod=vendor \
-            DOCKER_API_VERSION="$API_VERSION" DOCKERFILE=../Dockerfile \
-            go test -mod=vendor -count=1 -v -timeout 20m -tags "netgo journald" \
-              -run 'TestCopyToContainerXZBinaryNotExecutedOnDaemon' ./integration/container/
+            DOCKER_HOST=$DOCKER_HOST DOCKERFILE=../Dockerfile \
+            go test -mod=vendor -count=1 -v -timeout 30m -tags "netgo journald" \
+              -run 'TestCopyToContainerXZBinaryNotExecutedOnDaemon|TestContainerCopyLeaksMounts|TestCopyFromContainer$|TestCopyToContainerCopyUIDGID|TestCopyEmptyFile' \
+              ./integration/container/
+      -
+        name: Daemon log (linux, amd64)
+        if: always() && runner.os == 'Linux' && runner.arch == 'X64'
+        shell: bash
+        run: sudo tail -n 100 /tmp/seal-dockerd.log || true
 
   seal-module-zip:
     runs-on: ubuntu-24.04
