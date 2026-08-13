@@ -153,6 +153,7 @@ jobs:
       matrix:
         os:
           - ubuntu-24.04
+          - ubuntu-24.04-arm
     steps:
       -
         name: Checkout
@@ -202,8 +203,8 @@ jobs:
         run: |
           go vet -mod=vendor -tags "netgo journald" ./daemon/ ./integration/container/
       -
-        name: Integration tests for the docker cp CVEs against a dockerd built from source (linux, amd64)
-        if: runner.os == 'Linux' && runner.arch == 'X64'
+        name: Integration tests for the docker cp CVEs against a dockerd built from source (linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -e
@@ -276,8 +277,8 @@ jobs:
             echo "::endgroup::"
           done
       -
-        name: Daemon logs (linux, amd64)
-        if: always() && runner.os == 'Linux' && runner.arch == 'X64'
+        name: Daemon logs (linux)
+        if: always() && runner.os == 'Linux'
         shell: bash
         run: sudo tail -n 60 /tmp/seal-dockerd-graphdriver.log /tmp/seal-dockerd-snapshotter.log || true
 
