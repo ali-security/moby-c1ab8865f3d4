@@ -210,32 +210,6 @@ jobs:
           sudo apt-get install -y libseccomp-dev
           go build -mod=vendor -tags "netgo journald seccomp apparmor" -o /tmp/dockerd ./cmd/dockerd
           sudo install -m 0755 /tmp/dockerd /usr/local/bin/dockerd
-          # Run the suite against a daemon built from THIS tree, not the runner's
-          # pre-installed one: the tests that reuse testEnv's daemon (rather than
-          # starting their own) would otherwise exercise stock docker.
-          sudo mkdir -p /tmp/seal-docker /tmp/seal-exec
-          sudo -b dockerd --host unix:///var/run/docker-seal.sock \
-            --data-root /tmp/seal-docker --exec-root /tmp/seal-exec \
-            --containerd /run/containerd/containerd.sock \
-            --iptables=false --ip6tables=false --pidfile /tmp/seal-docker.pid \
-            > /tmp/seal-dockerd.log 2>&1
-          export DOCKER_HOST=unix:///var/run/docker-seal.sock
-          for i in $(seq 1 60); do
-            if sudo -E docker version > /dev/null 2>&1; then break; fi
-            sleep 2
-          done
-          sudo -E docker version
-          # The fixture's TestMain requires the whole frozen-image set on the
-          # daemon under test, and its fallback pulls the year-old digests pinned
-          # in the repo Dockerfile. Pre-populate instead; only busybox is used by
-          # these tests, so the hello-world arch tags are local aliases.
-          for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do
-            sudo -E docker pull "$img"
-          done
-          for tag in frozen amd64 arm64; do
-            sudo -E docker tag hello-world:latest "hello-world:$tag"
-          done
-          mkdir -p /tmp/integration-dest
           # Tests that start their own daemon go through testutil/daemon, which
           # always passes --containerd /var/run/docker/containerd/containerd.sock
           # (the moby dev-container path); point it at the runner's containerd.
@@ -244,22 +218,68 @@ jobs:
             sudo mkdir -p /var/run/docker/containerd
             sudo ln -sf /run/containerd/containerd.sock /var/run/docker/containerd/containerd.sock
           fi
-          # TestCopyToContainerXZBinaryNotExecutedOnDaemon is upstream's regression
-          # test for CVE-2026-41567. TestContainerCopyLeaksMounts drives a cp
-          # through openContainerFS with a real rslave bind mount, which is the
-          # mount wiring CVE-2026-42306 and CVE-2026-41568 change, and asserts the
-          # container's mountinfo is untouched afterwards. The remaining copy
-          # tests cover the ordinary extract/archive paths.
-          sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/integration-dest GOFLAGS=-mod=vendor \
-            DOCKER_HOST=$DOCKER_HOST DOCKERFILE=../Dockerfile \
-            go test -mod=vendor -count=1 -v -timeout 30m -tags "netgo journald" \
-              -run 'TestCopyToContainerXZBinaryNotExecutedOnDaemon|TestContainerCopyLeaksMounts|TestCopyFromContainer$|TestCopyToContainerCopyUIDGID|TestCopyEmptyFile' \
-              ./integration/container/
+          # Upstream matrixes its integration suite over both storage modes
+          # (.github/workflows/test.yml: storage = graphdriver | snapshotter),
+          # so run the tests under each. TEST_INTEGRATION_USE_SNAPSHOTTER is read
+          # by the daemon itself and by the test harness, so exporting it covers
+          # both this daemon and any the fixtures start.
+          for MODE in graphdriver snapshotter; do
+            echo "::group::integration tests ($MODE)"
+            if [ "$MODE" = "snapshotter" ]; then
+              export TEST_INTEGRATION_USE_SNAPSHOTTER=1
+            else
+              unset TEST_INTEGRATION_USE_SNAPSHOTTER || true
+            fi
+            # Run against a daemon built from THIS tree, not the runner's
+            # pre-installed one: the tests that reuse testEnv's daemon (rather
+            # than starting their own) would otherwise exercise stock docker.
+            sudo mkdir -p /tmp/seal-docker-$MODE /tmp/seal-exec-$MODE /tmp/integration-dest-$MODE
+            sudo -b -E dockerd --host unix:///var/run/docker-seal.sock \
+              --data-root /tmp/seal-docker-$MODE --exec-root /tmp/seal-exec-$MODE \
+              --containerd /run/containerd/containerd.sock \
+              --iptables=false --ip6tables=false --pidfile /tmp/seal-docker-$MODE.pid \
+              > /tmp/seal-dockerd-$MODE.log 2>&1
+            export DOCKER_HOST=unix:///var/run/docker-seal.sock
+            for i in $(seq 1 60); do
+              if sudo -E docker version > /dev/null 2>&1; then break; fi
+              sleep 2
+            done
+            sudo -E docker version
+            sudo -E docker info --format 'storage driver: {{.Driver}}'
+            # The fixture's TestMain requires the whole frozen-image set on the
+            # daemon under test, and its fallback pulls the year-old digests
+            # pinned in the repo Dockerfile. Pre-populate instead; only busybox
+            # is used by these tests, so the hello-world tags are local aliases.
+            for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do
+              sudo -E docker pull "$img"
+            done
+            for tag in frozen amd64 arm64; do
+              sudo -E docker tag hello-world:latest "hello-world:$tag"
+            done
+            # TestCopyToContainerXZBinaryNotExecutedOnDaemon is upstream's
+            # regression test for CVE-2026-41567. TestContainerCopyLeaksMounts
+            # drives a cp through openContainerFS with a real rslave bind mount,
+            # which is the mount wiring CVE-2026-42306 and CVE-2026-41568 change,
+            # and asserts the container's mountinfo is untouched afterwards. The
+            # remaining copy tests cover the ordinary extract/archive paths.
+            sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/integration-dest-$MODE GOFLAGS=-mod=vendor \
+              DOCKER_HOST=$DOCKER_HOST DOCKERFILE=../Dockerfile \
+              go test -mod=vendor -count=1 -v -timeout 30m -tags "netgo journald" \
+                -run 'TestCopyToContainerXZBinaryNotExecutedOnDaemon|TestContainerCopyLeaksMounts|TestCopyFromContainer$|TestCopyToContainerCopyUIDGID|TestCopyEmptyFile' \
+                ./integration/container/
+            sudo pkill -F /tmp/seal-docker-$MODE.pid || true
+            for i in $(seq 1 30); do
+              if ! [ -S /var/run/docker-seal.sock ]; then break; fi
+              sudo rm -f /var/run/docker-seal.sock 2>/dev/null || true
+              sleep 1
+            done
+            echo "::endgroup::"
+          done
       -
-        name: Daemon log (linux, amd64)
+        name: Daemon logs (linux, amd64)
         if: always() && runner.os == 'Linux' && runner.arch == 'X64'
         shell: bash
-        run: sudo tail -n 100 /tmp/seal-dockerd.log || true
+        run: sudo tail -n 60 /tmp/seal-dockerd-graphdriver.log /tmp/seal-dockerd-snapshotter.log || true
 
   seal-module-zip:
     runs-on: ubuntu-24.04
